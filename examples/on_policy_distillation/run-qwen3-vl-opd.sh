@@ -11,12 +11,12 @@ MODEL_NAME=${SLIME_SCRIPT_MODEL_NAME:-"Qwen3-VL-2B-Instruct"}
 NUM_GPUS=${SLIME_SCRIPT_NUM_GPUS:-8}
 USE_EXTERNAL_RAY=${SLIME_SCRIPT_EXTERNAL_RAY:-0}
 
-TRAIN_DATA=${SLIME_SCRIPT_TRAIN_DATA:-"/mnt/tidal-alsh01/dataset/redone/zengyu/xikun/geo3k_imgurl/train.parquet"}
-EVAL_DATA=${SLIME_SCRIPT_EVAL_DATA:-"/mnt/tidal-alsh01/dataset/redone/zengyu/xikun/geo3k_imgurl/test.parquet"}
+TRAIN_DATA=${SLIME_SCRIPT_TRAIN_DATA:-"/mnt/tidal-alsh01/dataset/redone/zengyu/xikun/slime/examples/on_policy_distillation/TreeVGR/train.jsonl@[0:3000]"}
+EVAL_DATA=${SLIME_SCRIPT_EVAL_DATA:-"/mnt/tidal-alsh01/dataset/redone/zengyu/xikun/slime/examples/on_policy_distillation/TreeVGR/test.jsonl"}
 HF_MODEL_PATH=${SLIME_SCRIPT_HF_MODEL_PATH:-"/mnt/tidal-alsh01/dataset/redone/zengyu/pretrain_model/${MODEL_NAME}"}
 
 # Teacher server (SGLang, for OPD teacher logprobs)
-TEACHER_IP=${SLIME_SCRIPT_TEACHER_IP:-"10.144.204.16"}
+TEACHER_IP=${SLIME_SCRIPT_TEACHER_IP:-"10.144.205.156"}
 TEACHER_PORT=${SLIME_SCRIPT_TEACHER_PORT:-13141}
 
 # Judge server (vLLM, for correctness scoring)
@@ -74,12 +74,12 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 # Check teacher / judge service
 curl -sf http://$TEACHER_IP:$TEACHER_PORT/health_generate > /dev/null
-# curl -sf http://$JUDGE_IP:$JUDGE_PORT/v1/models > /dev/null
+curl -sf http://$JUDGE_IP:$JUDGE_PORT/v1/models > /dev/null
 
 echo "Teacher model server is up at $TEACHER_IP:$TEACHER_PORT"
 echo "Judge model server is up at $JUDGE_IP:$JUDGE_PORT"
 
-SAVE_PATH=${SLIME_SCRIPT_SAVE_PATH:-"/mnt/tidal-alsh01/dataset/redone/zengyu/xikun/slime-2.4/checkpoints/qwen3-vl-2B_teacher_qwen3-vl-8B_geo3k_outcome+0.0kl_2.4"}
+SAVE_PATH=${SLIME_SCRIPT_SAVE_PATH:-"/mnt/tidal-alsh01/dataset/redone/zengyu/xikun/slime-2.4/checkpoints/qwen3-vl-2B_teacher_qwen3-vl-8B_treevgr_outcome+0.5kl_2.4"}
 
 CKPT_ARGS=(
    --hf-checkpoint ${HF_MODEL_PATH}
@@ -90,14 +90,14 @@ CKPT_ARGS=(
 
 ROLLOUT_ARGS=(
    --prompt-data ${TRAIN_DATA}
-   --input-key problem
+   --input-key prompt
    --label-key answer
    --apply-chat-template
    --rollout-shuffle
-   --num-rollout 3000
+   --num-epoch 1
    --rollout-batch-size 64
    --n-samples-per-prompt 8
-   --rollout-max-response-len 4096
+   --rollout-max-response-len 1024
    --rollout-temperature 1.0
    --global-batch-size 256
    --balance-data
@@ -107,7 +107,7 @@ ROLLOUT_ARGS=(
 MULTIMODAL_KEYS='{"image": "images"}'
 
 RM_ARGS=(
-   --custom-rm-path slime.rollout.multimodal_opd.reward_func_math
+   --custom-rm-path slime.rollout.multimodal_opd.reward_func_judge
    --custom-reward-post-process-path slime.rollout.multimodal_opd.post_process_opd
    --rm-url http://$TEACHER_IP:$TEACHER_PORT/generate
 )
@@ -119,11 +119,11 @@ LOG_ARGS=(
 
 EVAL_ARGS=(
    --eval-interval 10
-   --eval-prompt-data geo3k ${EVAL_DATA}
+   --eval-prompt-data treevgr ${EVAL_DATA}
    --n-samples-per-eval-prompt 1
-   --eval-max-response-len 4096
+   --eval-max-response-len 1024
    --eval-top-p 1
-   --eval-input-key problem
+   --eval-input-key prompt
    --eval-label-key answer
 )
 
@@ -131,7 +131,7 @@ GRPO_ARGS=(
    --advantage-estimator grpo
    # opd + reward as adv
    --use-opd
-   --opd-kl-coef 0.0
+   --opd-kl-coef 0.5
    --opd-type sglang
 
    --kl-loss-coef 0.00
@@ -158,7 +158,7 @@ SGLANG_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-opd
-   --wandb-group qwen3-vl-2B_teacher_qwen3-vl-8B_geo3k_outcome+0.0kl_2.4
+   --wandb-group qwen3-vl-2B_teacher_qwen3-vl-8B_treevgr_outcome+0.5kl_2.4
    --wandb-key "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"
 )
 

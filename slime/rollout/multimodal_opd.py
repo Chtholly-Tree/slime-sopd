@@ -83,8 +83,8 @@ async def _call_teacher(args, sample: Sample) -> dict:
         payload["image_data"] = [
             encode_image_for_rollout_engine(img) for img in teacher_images
         ]
-
-    async with aiohttp.ClientSession() as session:
+    timeout = aiohttp.ClientTimeout(total=600)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(args.rm_url, json=payload) as resp:
             resp.raise_for_status()
             return await resp.json()
@@ -135,7 +135,12 @@ async def _call_judge(args, sample: Sample) -> float:
             result = await resp.json()
 
     content = result["choices"][0]["message"]["content"].strip().lower()
-    return 1.0 if "correct" in content else 0.0
+    if "incorrect" in content:
+        return 0.0
+    if "correct" in content:
+        return 1.0
+    return 0.0
+
 
 
 def _group_normalize(
