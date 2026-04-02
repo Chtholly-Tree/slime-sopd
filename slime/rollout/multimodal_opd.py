@@ -10,9 +10,10 @@ any reward can be combined with any training algorithm via script args:
     slime.rollout.multimodal_opd.reward_func         - alias for reward_func_math
 
   Post-process functions (--custom-reward-post-process-path):
-    slime.rollout.multimodal_opd.post_process_grpo   - group-norm only (pure GRPO)
-    slime.rollout.multimodal_opd.post_process_opd    - group-norm + OPD teacher KL
-    slime.rollout.multimodal_opd.post_process_rewards - alias for post_process_opd
+    slime.rollout.multimodal_opd.post_process_grpo        - group-norm only (pure GRPO)
+    slime.rollout.multimodal_opd.post_process_opd         - group-norm + OPD teacher KL
+    slime.rollout.multimodal_opd.post_process_opd_kl_only - keep raw judge rewards for logging, use only KL as advantage
+    slime.rollout.multimodal_opd.post_process_rewards     - alias for post_process_opd
 
   Combinations:
 
@@ -31,14 +32,16 @@ any reward can be combined with any training algorithm via script args:
     # OPD + LLM-judge reward
     --custom-rm-path slime.rollout.multimodal_opd.reward_func_judge
     --custom-reward-post-process-path slime.rollout.multimodal_opd.post_process_opd
+
+    # OPD KL-only + LLM-judge logging
+    --custom-rm-path slime.rollout.multimodal_opd.reward_func_judge
+    --custom-reward-post-process-path slime.rollout.multimodal_opd.post_process_opd_kl_only
 """
 import logging
-import os
 
-import aiohttp
 import torch
 
-from slime.utils.processing_utils import encode_image_for_rollout_engine
+from slime.rollout.rm_hub.multimodal import call_llm_judge, call_multimodal_teacher, compute_math_reward
 from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -56,38 +59,12 @@ async def _call_teacher(args, sample: Sample) -> dict:
       1: asymmetric - teacher uses sample.metadata["teacher_prompt_ids"]
          + student response tokens.
     """
-    use_teacher_context = os.environ.get("USE_TEACHER_CONTEXT", "0") == "1"
-
-    if use_teacher_context and "teacher_prompt_ids" in sample.metadata:
-        response_ids = sample.tokens[-sample.response_length:]
-        input_ids = list(sample.metadata["teacher_prompt_ids"]) + list(response_ids)
-        teacher_images = sample.metadata.get(
-            "teacher_images",
-            (sample.multimodal_inputs or {}).get("images", []),
-        )
-    else:
-        input_ids = sample.tokens
-        teacher_images = (sample.multimodal_inputs or {}).get("images", [])
-
-    payload = {
-        "input_ids": input_ids,
-        "sampling_params": {
-            "temperature": 0,
-            "max_new_tokens": 0,
-            "skip_special_tokens": False,
-        },
-        "return_logprob": True,
-        "logprob_start_len": 0,
-    }
-    if teacher_images:
-        payload["image_data"] = [
-            encode_image_for_rollout_engine(img) for img in teacher_images
-        ]
-    timeout = aiohttp.ClientTimeout(total=600)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(args.rm_url, json=payload) as resp:
-            resp.raise_for_status()
-            return await resp.json()
+    return await call_multimodal_teacher(
+        args,
+        sample,
+        return_text_in_logprobs=False,
+        use_teacher_context_env=True,
+    )
 
 
 async def _call_judge(args, sample: Sample) -> float:
@@ -97,49 +74,7 @@ async def _call_judge(args, sample: Sample) -> float:
         JUDGE_URL   e.g. http://10.x.x.x:8000/v1
         JUDGE_MODEL model name served by vLLM (default: "default")
     """
-    judge_url = os.environ.get("JUDGE_URL")
-    assert judge_url, "JUDGE_URL environment variable is not set"
-    judge_model = os.environ.get("JUDGE_MODEL", "default")
-
-    question = sample.metadata.get("question", str(sample.label))
-    ground_truth = str(sample.label)
-    prediction = sample.response
-
-    judge_prompt = (
-        "Please evaluate whether the model's answer is correct by comparing it "
-        "with the standard answer.\n"
-        f"Question: {question}\n"
-        f"Ground Truth Answer: {ground_truth}\n"
-        f"Predicted Answer: {prediction}\n\n"
-        "**Instructions:**\n"
-        "- Compare the model's answer with the standard answer\n"
-        "- Focus on factual accuracy and key points\n"
-        "- Allow for different wording if the core meaning is the same\n"
-        "- Consider the answer correct if it captures the main points\n"
-        "- Output only one word: \"correct\" or \"incorrect\".\n\n"
-        "**Output format:**\ncorrect/incorrect"
-    )
-
-    payload = {
-        "model": judge_model,
-        "messages": [{"role": "user", "content": judge_prompt}],
-        "temperature": 0,
-        "max_tokens": 16,
-    }
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            f"{judge_url.rstrip('/')}/v1/chat/completions", json=payload
-        ) as resp:
-            resp.raise_for_status()
-            result = await resp.json()
-
-    content = result["choices"][0]["message"]["content"].strip().lower()
-    if "incorrect" in content:
-        return 0.0
-    if "correct" in content:
-        return 1.0
-    return 0.0
+    return await call_llm_judge(args, sample)
 
 
 
@@ -197,8 +132,7 @@ async def reward_func_math(args, sample: Sample, **kwargs) -> float:
 
     Safe during eval rollouts (no teacher/judge calls).
     """
-    from slime.rollout.rm_hub.math_utils import grade_answer_verl
-    return 1.0 if grade_answer_verl(sample.response, str(sample.label)) else 0.0
+    return compute_math_reward(sample)
 
 
 async def reward_func_judge(args, sample: Sample, **kwargs) -> float:
@@ -271,4 +205,44 @@ def post_process_opd(args, samples: list[Sample], **kwargs):
         grpo_std_normalization=getattr(args, "grpo_std_normalization", False),
     )
     return scores, normalized
+
+
+def post_process_opd_kl_only(args, samples: list[Sample], **kwargs):
+    """OPD KL-only: keep raw rewards for logging, but zero out reward advantages.
+
+    Use with: --advantage-estimator grpo --use-opd --opd-kl-coef <coef>
+              --rm-url http://<teacher-ip>:<port>/generate
+    Compatible with any reward_func_*.
+
+    Returns:
+        raw rewards: original sample.reward values for logging/metrics.
+        processed rewards: all-zero rewards so the final advantage signal comes
+        only from OPD KL added in compute_advantages_and_returns().
+    """
+    import asyncio as _asyncio
+    from slime.utils.async_utils import get_async_loop
+
+    response_lengths = [sample.response_length for sample in samples]
+    scores = [float(sample.reward) for sample in samples]
+
+    async def _gather():
+        return await _asyncio.gather(*[_call_teacher(args, s) for s in samples])
+
+    teacher_results = get_async_loop().run(_gather())
+
+    teacher_log_probs = [
+        torch.tensor(
+            [item[0] for item in r["meta_info"]["input_token_logprobs"][1:]],
+            dtype=torch.float32,
+        )[-resp_len:]
+        for r, resp_len in zip(teacher_results, response_lengths)
+    ]
+    for sample, t_lp in zip(samples, teacher_log_probs):
+        sample.teacher_log_probs = t_lp
+
+    _attach_reward_metrics(samples, scores, teacher_log_probs=teacher_log_probs)
+
+    zero_rewards = [0.0] * len(samples)
+    return scores, zero_rewards
+
 
