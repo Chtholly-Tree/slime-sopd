@@ -1194,6 +1194,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="URL for the reward model service for --rm-type remote_rm, e.g. http://localhost:8000",
             )
             parser.add_argument(
+                "--judge-url",
+                type=str,
+                default=None,
+                help="URL for the judge model service used by custom multimodal reward functions.",
+            )
+            parser.add_argument(
                 "--custom-rm-path",
                 type=str,
                 default=None,

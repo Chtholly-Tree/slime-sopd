@@ -51,22 +51,52 @@ async def call_multimodal_teacher(
             return await resp.json()
 
 
-async def call_llm_judge(args, sample: Sample) -> float:
-    """Call vLLM judge server to score correctness."""
-    judge_url = os.environ.get("JUDGE_URL")
-    assert judge_url, "JUDGE_URL environment variable is not set"
-    judge_model = os.environ.get("JUDGE_MODEL", "default")
+def _extract_boxed_answer(response: str) -> str | None:
+    """Extract \\boxed{...} answer from response if present."""
+    import re
+    match = re.search(r'\\boxed\{([^}]+)\}', response)
+    if match:
+        return match.group(1)
+    return None
 
-    question = sample.metadata.get("question", str(sample.label))
+
+async def call_llm_judge(args, sample: Sample) -> float:
+    """Call SGLang teacher model to score correctness with fast-path math rule judge.
+    
+    Strategy:
+    1. Try fast math rule judge first (compute_math_reward)
+    2. If correct, return 1.0 immediately (no LLM call)
+    3. If incorrect, fall back to SGLang teacher model for judgment
+    4. LLM judge extracts \\boxed{...} if present, otherwise uses full response
+    """
+    # Fast path: try rule-based math judge first
+    # breakpoint()
+    try:
+        math_reward = compute_math_reward(sample)
+        if math_reward > 0.5:  # Correct according to rule judge
+            return 1.0
+    except Exception:
+        # If rule judge fails, continue to LLM judge
+        pass
+
+    # Fallback: SGLang teacher model judge
+    question = sample.metadata.get("prompt", str(sample.label))
     ground_truth = str(sample.label)
     prediction = sample.response
+
+    # Try to extract \\boxed{...} answer for cleaner judgment
+    boxed_answer = _extract_boxed_answer(prediction)
+    if boxed_answer:
+        prediction_for_judge = f"\\boxed{{{boxed_answer}}}"
+    else:
+        prediction_for_judge = prediction
 
     judge_prompt = (
         "Please evaluate whether the model's answer is correct by comparing it "
         "with the standard answer.\n"
         f"Question: {question}\n"
         f"Ground Truth Answer: {ground_truth}\n"
-        f"Predicted Answer: {prediction}\n\n"
+        f"Predicted Answer: {prediction_for_judge}\n\n"
         "**Instructions:**\n"
         "- Compare the model's answer with the standard answer\n"
         "- Focus on factual accuracy and key points\n"
@@ -76,19 +106,23 @@ async def call_llm_judge(args, sample: Sample) -> float:
         "**Output format:**\ncorrect/incorrect"
     )
 
+    # Use SGLang teacher model (same as args.rm_url)
     payload = {
-        "model": judge_model,
-        "messages": [{"role": "user", "content": judge_prompt}],
-        "temperature": 0,
-        "max_tokens": 16,
+        "text": judge_prompt,
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": 30,
+            "skip_special_tokens": False,
+        },
     }
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(f"{judge_url.rstrip('/')}/v1/chat/completions", json=payload) as resp:
+    timeout = aiohttp.ClientTimeout(total=600)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(args.judge_url, json=payload) as resp:
             resp.raise_for_status()
             result = await resp.json()
 
-    content = result["choices"][0]["message"]["content"].strip().lower()
+    content = result.get("text", "").strip().lower()
     if "incorrect" in content:
         return 0.0
     if "correct" in content:
