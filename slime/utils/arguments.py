@@ -556,6 +556,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     'JSON string for multimodal data mapping media types to data keys. Example: \'{"image": "image_file"}\''
                 ),
             )
+            parser.add_argument(
+                "--multimodal-load-workers",
+                type=int,
+                default=0,
+                help=(
+                    "Number of worker threads used to preprocess multimodal prompt samples when building the rollout "
+                    "dataset. Set to 0 or 1 to disable multithreading."
+                ),
+            )
             parser.add_argument("--metadata-key", type=str, default="metadata", help="JSON dataset key")
             parser.add_argument(
                 "--tool-key",
@@ -1218,6 +1227,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--teacher-request-max-concurrency",
+                type=int,
+                default=32,
+                help=(
+                    "Maximum number of concurrent HTTP requests sent to teacher/reward services "
+                    "from custom rollout post-processing hooks."
+                ),
+            )
+            parser.add_argument(
                 "--custom-convert-samples-to-train-data-path",
                 type=str,
                 default=None,
@@ -1226,6 +1244,53 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "If set, this function will replace the default _convert_samples_to_train_data. "
                     "The function should have the signature `def convert_samples_to_train_data(args, samples) -> dict`."
                 ),
+            )
+            # --rm-type llm_judge
+            parser.add_argument(
+                "--llm-judge-api-key",
+                type=str,
+                default=None,
+                help="API key for the LLM judge service (used with --rm-type llm_judge).",
+            )
+            parser.add_argument(
+                "--llm-judge-base-url",
+                type=str,
+                default=None,
+                help=(
+                    "Base URL of the LLM judge API (used with --rm-type llm_judge). "
+                    "Example: https://maas.devops.xiaohongshu.com/v1"
+                ),
+            )
+            parser.add_argument(
+                "--llm-judge-model",
+                type=str,
+                default=None,
+                help="Model name for the LLM judge API (used with --rm-type llm_judge). "
+                "Example: qwen3.5-35b-a3b",
+            )
+            parser.add_argument(
+                "--llm-judge-max-tokens",
+                type=int,
+                default=256,
+                help="max_tokens for LLM judge generation (default: 256).",
+            )
+            parser.add_argument(
+                "--llm-judge-temperature",
+                type=float,
+                default=0.0,
+                help="temperature for LLM judge generation (default: 0.0).",
+            )
+            parser.add_argument(
+                "--llm-judge-max-retries",
+                type=int,
+                default=3,
+                help="Max retries per sample for LLM judge API (default: 3).",
+            )
+            parser.add_argument(
+                "--llm-judge-batch-size",
+                type=int,
+                default=64,
+                help="Max concurrent LLM judge API calls per batch (default: 64).",
             )
             return parser
 

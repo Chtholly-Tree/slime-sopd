@@ -1,12 +1,16 @@
+import copy
 import itertools
 import json
 import logging
 import os
 import random
 import re
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import ray
+from tqdm import tqdm
 
 try:
     import pyarrow.parquet as pq
@@ -130,12 +134,24 @@ def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_l
 def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimodal_keys: dict = None):
     prompt = data.get(prompt_key)
 
+    if prompt is None:
+        available_keys = sorted(data.keys())
+        raise ValueError(
+            f"Dataset record is missing prompt key '{prompt_key}' or its value is None. "
+            f"Available keys: {available_keys}"
+        )
+
     if isinstance(prompt, str):
         # If prompt is a string and we don't apply chat template, return the prompt as is.
         if not as_conversation:
             return prompt
         else:
             prompt = [{"role": "user", "content": prompt}]
+
+    if not isinstance(prompt, list):
+        raise ValueError(
+            f"Prompt field '{prompt_key}' must be a string or a list of messages, got {type(prompt)} instead"
+        )
 
     if multimodal_keys:
         # Build mapping: placeholder -> (MultimodalType, content_list)
@@ -192,6 +208,112 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
     return prompt
 
 
+def _build_multimodal_inputs(prompt, processor):
+    from slime.utils.processing_utils import process_vision_info
+
+    assert isinstance(prompt, list), f"prompt must be a list when processor is not None, got {type(prompt)} instead"
+    return process_vision_info(prompt, processor)
+
+
+def _load_process_local_tokenizer_and_processor(tokenizer, processor):
+    from slime.utils.processing_utils import load_processor, load_tokenizer
+
+    if isinstance(tokenizer, str):
+        loaded_tokenizer = load_tokenizer(tokenizer, trust_remote_code=True)
+    else:
+        loaded_tokenizer = tokenizer
+
+    if isinstance(processor, str):
+        loaded_processor = load_processor(processor, trust_remote_code=True)
+    else:
+        loaded_processor = processor
+
+    return loaded_tokenizer, loaded_processor
+
+
+def _process_single_record_mp(task: tuple[dict, dict]):
+    data, config = task
+    tokenizer, processor = _load_process_local_tokenizer_and_processor(config["tokenizer"], config["processor"])
+    return _process_single_record(
+        data,
+        tokenizer=tokenizer,
+        processor=processor,
+        prompt_key=config["prompt_key"],
+        multimodal_keys=config["multimodal_keys"],
+        label_key=config["label_key"],
+        tool_key=config["tool_key"],
+        metadata_key=config["metadata_key"],
+        apply_chat_template=config["apply_chat_template"],
+        apply_chat_template_kwargs=config["apply_chat_template_kwargs"],
+    )
+
+
+def _process_records_in_process_pool(all_data, process_config, max_workers, progress_kwargs):
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp.get_context("spawn")) as executor:
+        return list(
+            tqdm(
+                executor.map(
+                    _process_single_record_mp,
+                    ((data, process_config) for data in all_data),
+                    chunksize=32,
+                ),
+                total=len(all_data),
+                **progress_kwargs,
+            )
+        )
+
+
+def _process_single_record(
+    data: dict,
+    *,
+    tokenizer,
+    processor,
+    prompt_key: str,
+    multimodal_keys: dict | None,
+    label_key: str | None,
+    tool_key: str | None,
+    metadata_key: str,
+    apply_chat_template: bool,
+    apply_chat_template_kwargs: dict | None,
+):
+    # Both chat templates and multimodal inputs require conversation format (list of message dicts)
+    as_conversation = apply_chat_template or (multimodal_keys is not None)
+    prompt = _build_messages(data, prompt_key, as_conversation, multimodal_keys)
+    raw_prompt = copy.deepcopy(prompt)
+
+    metadata = data.get(metadata_key) or {}
+    tools = None
+    if tool_key is not None and tool_key in data:
+        tools = data[tool_key]
+        if isinstance(tools, str):
+            tools = json.loads(tools)
+        elif isinstance(tools, np.ndarray):
+            tools = tools.tolist()
+        assert isinstance(tools, list), f"tools must be a list, got {type(tools)} instead"
+        metadata["tools"] = tools
+
+    if apply_chat_template:
+        output_prompt = tokenizer.apply_chat_template(
+            prompt,
+            tools=tools,
+            tokenize=False,
+            add_generation_prompt=True,
+            **(apply_chat_template_kwargs or {}),
+        )
+    else:
+        output_prompt = prompt
+
+    multimodal_inputs = _build_multimodal_inputs(prompt, processor) if processor else None
+    metadata["raw_prompt"] = raw_prompt
+
+    return Sample(
+        prompt=output_prompt,
+        label=data[label_key] if label_key is not None else None,
+        metadata=metadata,
+        multimodal_inputs=multimodal_inputs,
+    )
+
+
 class Dataset:
     def __init__(
         self,
@@ -208,53 +330,52 @@ class Dataset:
         seed=42,
         apply_chat_template=False,
         apply_chat_template_kwargs=None,
+        multimodal_load_workers=0,
     ):
-        origin_samples = []
-        for data in read_file(path):
-            # Both chat templates and multimodal inputs require conversation format (list of message dicts)
-            as_conversation = apply_chat_template or (multimodal_keys is not None)
-            prompt = _build_messages(data, prompt_key, as_conversation, multimodal_keys)
-
-            metadata = data.get(metadata_key) or {}
-            tools = None
-            if tool_key is not None and tool_key in data:
-                tools = data[tool_key]
-                if isinstance(tools, str):
-                    tools = json.loads(tools)
-                elif isinstance(tools, np.ndarray):
-                    tools = tools.tolist()
-                assert isinstance(tools, list), f"tools must be a list, got {type(tools)} instead"
-                metadata["tools"] = tools
-
-            if apply_chat_template:
-                output_prompt = tokenizer.apply_chat_template(
-                    prompt,
-                    tools=tools,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    **(apply_chat_template_kwargs or {}),
-                )
-            else:
-                output_prompt = prompt
-
-            if processor:
-                from slime.utils.processing_utils import process_vision_info
-
-                assert isinstance(
-                    prompt, list
-                ), f"prompt must be a list when processor is not None, got {type(prompt)} instead"
-                multimodal_inputs = process_vision_info(prompt, processor)
-            else:
-                multimodal_inputs = None
-
-            origin_samples.append(
-                Sample(
-                    prompt=output_prompt,
-                    label=data[label_key] if label_key is not None else None,
-                    metadata=metadata,
-                    multimodal_inputs=multimodal_inputs,
-                )
+        all_data = list(read_file(path))
+        progress_desc = f"Loading dataset {os.path.basename(_parse_generalized_path(path)[0])}"
+        progress_kwargs = {"desc": progress_desc, "unit": "samples", "miniters": 5000}
+        if processor and multimodal_load_workers and multimodal_load_workers > 1:
+            tokenizer_ref = getattr(tokenizer, "name_or_path", tokenizer)
+            processor_ref = getattr(processor, "name_or_path", processor)
+            process_config = {
+                "tokenizer": tokenizer_ref,
+                "processor": processor_ref,
+                "prompt_key": prompt_key,
+                "multimodal_keys": multimodal_keys,
+                "label_key": label_key,
+                "tool_key": tool_key,
+                "metadata_key": metadata_key,
+                "apply_chat_template": apply_chat_template,
+                "apply_chat_template_kwargs": apply_chat_template_kwargs,
+            }
+            logger.info(
+                "Loading multimodal dataset with %s worker processes from %s",
+                multimodal_load_workers,
+                path,
             )
+            origin_samples = _process_records_in_process_pool(
+                all_data,
+                process_config=process_config,
+                max_workers=multimodal_load_workers,
+                progress_kwargs=progress_kwargs,
+            )
+        else:
+            origin_samples = [
+                _process_single_record(
+                    data,
+                    tokenizer=tokenizer,
+                    processor=processor,
+                    prompt_key=prompt_key,
+                    multimodal_keys=multimodal_keys,
+                    label_key=label_key,
+                    tool_key=tool_key,
+                    metadata_key=metadata_key,
+                    apply_chat_template=apply_chat_template,
+                    apply_chat_template_kwargs=apply_chat_template_kwargs,
+                )
+                for data in tqdm(all_data, **progress_kwargs)
+            ]
 
         if max_length is not None:
             self.origin_samples = filter_long_prompt(origin_samples, tokenizer, processor, max_length)

@@ -95,7 +95,7 @@ def custom_eval_log(rollout_id, args, data, extra_metrics):
     """Custom eval metrics logger.
 
     For each eval dataset:
-      eval/{name}/math_accuracy   - mean correctness (pass@1)
+      eval/{name}/accuracy   - mean correctness (pass@1)
       eval/{name}/truncated_ratio
 
     Returns True to signal the framework that logging is handled here.
@@ -107,13 +107,13 @@ def custom_eval_log(rollout_id, args, data, extra_metrics):
         truncated = info.get("truncated", [])
         prefix = f"eval/{dataset_name}"
 
-        log_dict[f"{prefix}/math_accuracy"] = float(np.mean(rewards))
+        log_dict[f"{prefix}/accuracy"] = float(np.mean(rewards))
 
         if truncated:
             log_dict[f"{prefix}/truncated_ratio"] = float(np.mean(truncated))
 
     logger.info(f"eval {rollout_id}: {log_dict}")
     step = compute_rollout_step(args, rollout_id)
-    log_dict["rollout/step"] = step
-    log(args, log_dict, step_key="rollout/step")
+    # log_dict["rollout/step"] = step
+    # log(args, log_dict, step_key="rollout/step")
     return True
