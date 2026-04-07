@@ -362,13 +362,16 @@ def apply_opd_kl_to_advantages(
     advantages: list[torch.Tensor],
     student_log_probs: list[torch.Tensor] | None,
 ) -> None:
-    """Apply on-policy distillation KL penalty to advantages.
+    """Apply on-policy distillation signal to advantages.
 
-    Computes reverse KL (student_logp - teacher_logp) and adds weighted penalty
-    to advantages in-place. This is orthogonal to the base advantage estimator.
+    By default this adds a per-token reverse-KL penalty to the existing
+    advantages. When ``args.opd_gamma`` is set, it instead computes a
+    discounted return over token rewards ``teacher_logp - student_logp`` and
+    adds the discounted OPD return to the base advantages.
 
     Args:
-        args: Configuration containing `use_opd` and `opd_kl_coef`.
+        args: Configuration containing `use_opd`, `opd_kl_coef`, and optional
+            `opd_gamma`.
         rollout_data: Dict containing "teacher_log_probs".
         advantages: List of advantage tensors to modify in-place.
         student_log_probs: List of student log-probability tensors.
@@ -386,15 +389,38 @@ def apply_opd_kl_to_advantages(
 
     device = student_log_probs[0].device
     teacher_log_probs = [t.to(device=device) for t in teacher_log_probs]
+    opd_gamma = getattr(args, "opd_gamma", None)
+    opd_reward_clamp_min = getattr(args, "opd_reward_clamp_min", None)
 
     reverse_kls = []
+    opd_discounted_returns = []
+    opd_token_rewards = []
     for i, adv in enumerate(advantages):
         reverse_kl = student_log_probs[i] - teacher_log_probs[i]
-        advantages[i] = adv - args.opd_kl_coef * reverse_kl
         reverse_kls.append(reverse_kl)
 
-    # Store reverse KL for logging
+        if opd_gamma is None:
+            advantages[i] = adv - args.opd_kl_coef * reverse_kl
+            continue
+
+        discounted_opd = torch.zeros_like(reverse_kl)
+        running_return = torch.zeros((), dtype=reverse_kl.dtype, device=reverse_kl.device)
+        token_rewards = teacher_log_probs[i] - student_log_probs[i]
+        if opd_reward_clamp_min is not None:
+            token_rewards = torch.clamp(token_rewards, min=opd_reward_clamp_min, max=0.0)
+        opd_token_rewards.append(token_rewards)
+        for t in reversed(range(token_rewards.size(0))):
+            running_return = token_rewards[t] + opd_gamma * running_return
+            discounted_opd[t] = running_return
+
+        advantages[i] = adv + args.opd_kl_coef * discounted_opd
+        opd_discounted_returns.append(discounted_opd)
+
+    # Store OPD diagnostics for logging
     rollout_data["opd_reverse_kl"] = reverse_kls
+    if opd_gamma is not None:
+        rollout_data["opd_discounted_returns"] = opd_discounted_returns
+        rollout_data["opd_token_rewards"] = opd_token_rewards
 
 
 def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:

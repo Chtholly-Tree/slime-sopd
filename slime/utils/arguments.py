@@ -996,6 +996,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="On-policy distillation KL penalty coefficient. Default is 1.0.",
             )
             parser.add_argument(
+                "--opd-gamma",
+                type=float,
+                default=None,
+                help=(
+                    "Optional discount factor for OPD token rewards. When set, OPD uses discounted returns of "
+                    "(teacher_log_probs - student_log_probs) instead of applying only the per-token difference."
+                ),
+            )
+            parser.add_argument(
+                "--opd-reward-clamp-min",
+                type=float,
+                default=None,
+                help=(
+                    "Optional lower clamp for OPD token rewards (teacher_log_probs - student_log_probs) before "
+                    "discounting. Useful to avoid extreme negative rewards from very small teacher log-probs."
+                ),
+            )
+            parser.add_argument(
                 "--opd-teacher-load",
                 type=str,
                 default=None,
