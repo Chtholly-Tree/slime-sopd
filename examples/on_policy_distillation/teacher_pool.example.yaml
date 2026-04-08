@@ -1,0 +1,46 @@
+# Example teacher pool config for multimodal GOLD / OPD.
+# Usage in training script:
+#   --teacher-pool-config examples/on_policy_distillation/teacher_pool.example.yaml \
+#   --teacher-model-name qwen3_5_9b_teacher
+#
+# Notes:
+# - Endpoints are grouped by teacher model name.
+# - `--teacher-model-name` selects exactly one group below.
+# - Each endpoint may define either `url`, or `host` + `port` (+ optional `path`).
+# - `max_concurrency` is the per-endpoint request limit inside one training process.
+
+models:
+  qwen3_5_9b_teacher:
+    request_timeout_sec: 600
+    max_retries: 2
+    retry_backoff_sec: 0.5
+    cooldown_sec: 30
+    failure_threshold: 3
+    endpoints:
+      - name: qwen3_5_9b_teacher_a
+        host: 10.144.205.174
+        port: 13141
+        max_concurrency: 16
+      - name: qwen3_5_9b_teacher_b
+        host: 10.144.205.175
+        port: 13141
+        max_concurrency: 16
+      - name: qwen3_5_9b_teacher_c
+        url: http://10.144.205.176:13141/generate
+        max_concurrency: 8
+
+  qwen3_5_35b_teacher:
+    request_timeout_sec: 900
+    max_retries: 1
+    retry_backoff_sec: 1.0
+    cooldown_sec: 60
+    failure_threshold: 2
+    endpoints:
+      - name: qwen3_5_35b_teacher_a
+        host: 10.144.206.101
+        port: 13141
+        max_concurrency: 8
+      - name: qwen3_5_35b_teacher_b
+        host: 10.144.206.102
+        port: 13141
+        max_concurrency: 8
