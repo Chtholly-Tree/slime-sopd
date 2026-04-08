@@ -30,12 +30,12 @@ from __future__ import annotations
 import os
 import time
 
-import aiohttp
 import torch
 from transformers import AutoTokenizer
 
 from slime.rollout.rm_hub.multimodal import call_llm_judge, compute_math_reward
 from slime.utils.processing_utils import build_processor_kwargs, encode_image_for_rollout_engine, load_processor
+from slime.utils.teacher_pool import get_teacher_pool
 from slime.utils.types import Sample
 
 
@@ -151,11 +151,21 @@ async def _call_teacher(args, sample: Sample) -> dict:
     if teacher_images:
         payload["image_data"] = [encode_image_for_rollout_engine(img) for img in teacher_images]
 
-    timeout = aiohttp.ClientTimeout(total=600)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(args.rm_url, json=payload) as resp:
-            resp.raise_for_status()
-            result = await resp.json()
+    teacher_model_name = getattr(args, "teacher_model_name", None)
+    teacher_pool_config = getattr(args, "teacher_pool_config", None)
+    if teacher_model_name and teacher_pool_config:
+        result, endpoint = await get_teacher_pool(args).request_json(payload, request_name="gold_teacher")
+        sample.metadata["gold_teacher_endpoint"] = endpoint.name
+        sample.metadata["gold_teacher_url"] = endpoint.url
+        sample.metadata["gold_teacher_model_name"] = teacher_model_name
+    else:
+        import aiohttp
+
+        timeout = aiohttp.ClientTimeout(total=600)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(args.rm_url, json=payload) as resp:
+                resp.raise_for_status()
+                result = await resp.json()
 
     result.setdefault("meta_info", {})["gold_teacher_prompt_len"] = teacher_prompt_len
     result["meta_info"]["gold_teacher_input_ids"] = teacher_input_ids

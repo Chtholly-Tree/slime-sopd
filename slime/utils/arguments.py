@@ -1254,6 +1254,33 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--teacher-pool-config",
+                type=str,
+                default=None,
+                help=(
+                    "Path to a YAML config file that groups teacher endpoints by model name. "
+                    "Used by custom teacher-calling rollout hooks such as multimodal GOLD."
+                ),
+            )
+            parser.add_argument(
+                "--teacher-model-name",
+                type=str,
+                default=None,
+                help=(
+                    "Teacher model name key inside --teacher-pool-config. "
+                    "When set, teacher requests will be routed to the endpoint pool for this model."
+                ),
+            )
+            parser.add_argument(
+                "--gold-teacher-hf-checkpoint",
+                type=str,
+                default=None,
+                help=(
+                    "Local HuggingFace checkpoint path for the GOLD teacher tokenizer/processor. "
+                    "Used to build teacher-side tokenization for multimodal GOLD."
+                ),
+            )
+            parser.add_argument(
                 "--custom-convert-samples-to-train-data-path",
                 type=str,
                 default=None,

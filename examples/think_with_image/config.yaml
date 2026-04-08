@@ -1,0 +1,17 @@
+# Think-with-Image: VLM multi-turn tool-calling RL training configuration
+
+# Maximum assistant generations per rollout episode.
+# Each tool call (or non-tool response) counts as one turn.
+max_turns: 5
+
+# Python path of the interaction environment module.
+# Must expose build_env(sample, args) -> VLMToolEnv.
+rollout_interaction_env_path: examples.think_with_image.env
+
+# Working directory where zoomed images are saved during rollout.
+# Must be accessible from all Ray workers.
+vlm_rollout_work_dir: /mnt/tidal-alsh01/dataset/redone/zengyu/xikun/slime-2.4/examples/think_with_image/vlm_rollout
+
+# Maximum total tokens (prompt + all response turns) before truncation.
+# Optional. When omitted the rollout falls back to rollout_max_response_len.
+# rollout_max_context_len: 8192

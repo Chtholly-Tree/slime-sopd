@@ -418,10 +418,6 @@ def apply_opd_kl_to_advantages(
 
     # Store OPD diagnostics for logging
     rollout_data["opd_reverse_kl"] = reverse_kls
-    if opd_gamma is not None:
-        rollout_data["opd_discounted_returns"] = opd_discounted_returns
-        rollout_data["opd_token_rewards"] = opd_token_rewards
-
 
 def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
     """Compute advantages and returns in-place based on `args.advantage_estimator`.
