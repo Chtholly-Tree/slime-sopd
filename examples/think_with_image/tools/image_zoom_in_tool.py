@@ -34,7 +34,7 @@ class ImageZoomInTool:
 
     def __init__(
         self,
-        work_dir: str = "/mnt/tidal-alsh01/dataset/redone/zengyu/xikun/slime-2.4/examples/think_with_image/vlm_rollout",
+        work_dir: str = "/tmp/vlm_rollout",
         min_pixels: int = 256 * 32 * 32,
         max_pixels: int = 12845056,
     ):
@@ -152,12 +152,9 @@ class ImageZoomInTool:
                 return [new_left, new_top, new_right, new_bottom]
         return [left, top, right, bottom]
 
-    def _load_image(self, image_arg: str | Image.Image) -> Image.Image | None:
-        """Load an image from a PIL image, file path, URL, or relative path."""
+    def _load_image(self, image_arg: str) -> Image.Image | None:
+        """Load an image from a file path, URL, or relative path."""
         try:
-            if isinstance(image_arg, Image.Image):
-                return image_arg
-
             if image_arg.startswith("file://"):
                 image_arg = image_arg[len("file://") :]
 
