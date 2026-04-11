@@ -34,7 +34,7 @@ class ImageZoomInTool:
 
     def __init__(
         self,
-        work_dir: str = "/tmp/vlm_rollout",
+        work_dir: str = "/mnt/tidal-alsh01/dataset/redone/zengyu/xikun/slime-2.4/examples/think_with_image/vlm_rollout",
         min_pixels: int = 256 * 32 * 32,
         max_pixels: int = 12845056,
     ):
@@ -152,9 +152,12 @@ class ImageZoomInTool:
                 return [new_left, new_top, new_right, new_bottom]
         return [left, top, right, bottom]
 
-    def _load_image(self, image_arg: str) -> Image.Image | None:
-        """Load an image from a file path, URL, or relative path."""
+    def _load_image(self, image_arg: str | Image.Image) -> Image.Image | None:
+        """Load an image from a PIL image, file path, URL, or relative path."""
         try:
+            if isinstance(image_arg, Image.Image):
+                return image_arg
+
             if image_arg.startswith("file://"):
                 image_arg = image_arg[len("file://") :]
 
@@ -225,12 +228,24 @@ class ImageZoomInTool:
             # Crop the image
             cropped_image = image.crop((left, top, right, bottom))
 
-            # Resize according to smart_resize logic
-            new_w, new_h = self._smart_resize(
-                int(bottom - top),
-                int(right - left),
-                factor=32,
-            )
+            # Resize while preserving aspect ratio
+            cropped_w, cropped_h = cropped_image.size
+            aspect_ratio = cropped_w / cropped_h
+
+            # Calculate target size within min/max pixel constraints
+            # Use a fixed target size that preserves aspect ratio
+            target_pixels = min(cropped_w * cropped_h, self.max_pixels)
+            target_h = int(math.sqrt(target_pixels / aspect_ratio))
+            target_w = int(target_h * aspect_ratio)
+
+            # Round to factor of 32 (only once, using floor to shrink slightly if needed)
+            new_h = self._floor_by_factor(target_h, 32)
+            new_w = self._floor_by_factor(target_w, 32)
+
+            # Ensure minimum size
+            new_h = max(64, new_h)
+            new_w = max(64, new_w)
+
             cropped_image = cropped_image.resize((new_w, new_h), resample=Image.BICUBIC)
 
             # Save the zoomed image
@@ -241,3 +256,4 @@ class ImageZoomInTool:
 
         except Exception as e:
             return {"error": f"Tool execution error: {str(e)}"}
+
