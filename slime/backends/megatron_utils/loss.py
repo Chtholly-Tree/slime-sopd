@@ -356,6 +356,12 @@ def get_values(
     return torch.empty((0,), device=logits.device), res
 
 
+def _normalize_sequence_tensor(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    if x.numel() == 0:
+        return x
+    return (x - x.mean()) / (x.std() + eps)
+
+
 def apply_opd_kl_to_advantages(
     args: Namespace,
     rollout_data: RolloutBatch,
@@ -400,7 +406,9 @@ def apply_opd_kl_to_advantages(
         reverse_kls.append(reverse_kl)
 
         if opd_gamma is None:
-            advantages[i] = adv - args.opd_kl_coef * reverse_kl
+            normalized_reverse_kl = _normalize_sequence_tensor(reverse_kl)
+            advantages[i] = adv - args.opd_kl_coef * normalized_reverse_kl
+            reverse_kls[-1] = normalized_reverse_kl
             continue
 
         discounted_opd = torch.zeros_like(reverse_kl)

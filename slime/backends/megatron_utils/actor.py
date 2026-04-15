@@ -219,6 +219,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 for mm_dict in rollout_data["multimodal_train_inputs"]
             ]
 
+        if "metadata" in rollout_data:
+            rollout_data["metadata"] = list(rollout_data["metadata"])
+
         if self.args.qkv_format == "bshd":
             # TODO: micro-batch wise dynamic, possibly move to @data.py:get_data_iterator
             max_seq_len = max(rollout_data["total_lengths"])

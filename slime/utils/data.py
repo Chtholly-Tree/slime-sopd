@@ -2,6 +2,7 @@ import copy
 import itertools
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -18,12 +19,42 @@ except ImportError:
     pq = None
 
 from slime.utils.types import MultimodalTypes, Sample
-
 from .timer import Timer
 
 __all__ = ["Dataset"]
 
 logger = logging.getLogger(__name__)
+
+# =========================
+# helpers
+# =========================
+
+def _batched(iterable, batch_size: int):
+    it = iter(iterable)
+    while True:
+        chunk = list(itertools.islice(it, batch_size))
+        if not chunk:
+            return
+        yield chunk
+
+
+def _estimate_num_rows(path: str):
+    real_path, row_slice = _parse_generalized_path(path)
+
+    if not os.path.exists(real_path):
+        return None
+
+    if real_path.endswith(".parquet") and pq is not None:
+        total = pq.ParquetFile(real_path).metadata.num_rows
+        if row_slice is None:
+            return total
+        start, stop, step = row_slice.indices(total)
+        if step <= 0:
+            return None
+        return max(0, (stop - start + step - 1) // step)
+
+    # jsonl 不强求统计总数，避免额外再扫一遍文件
+    return None
 
 
 def read_file(path):
@@ -44,7 +75,7 @@ def read_file(path):
                     try:
                         yield json.loads(line)
                     except json.JSONDecodeError as e:
-                        print(f"JSON decode error at line {line_num}: {e}")
+                        logger.warning("JSON decode error at line %s: %s", line_num, e)
                         continue
 
         reader = jsonl_reader(path)
@@ -55,8 +86,8 @@ def read_file(path):
 
         def parquet_reader(p):
             pf = pq.ParquetFile(p)
-
-            for batch in pf.iter_batches():
+            # batch_size 可以按情况调大/调小
+            for batch in pf.iter_batches(batch_size=2048):
                 yield from batch.to_pylist()
 
         reader = parquet_reader(path)
@@ -65,7 +96,6 @@ def read_file(path):
         raise ValueError(f"Unsupported file format: {path}. Supported formats are .jsonl and .parquet.")
 
     if row_slice is not None:
-
         logger.info("read_file path=%s applying slice row_slice=%s", path, row_slice)
         reader = itertools.islice(reader, row_slice.start, row_slice.stop, row_slice.step)
 
@@ -82,55 +112,6 @@ def _parse_generalized_path(s: str):
     return s, None
 
 
-def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_length: int | None) -> list[Sample]:
-    if max_length is None:
-        return origin_samples
-
-    if not isinstance(origin_samples[0].prompt, str):
-        logger.warning(
-            "Skipping max_length check for list prompt. Set apply_chat_template=True to enable length filtering."
-        )
-        return origin_samples
-
-    if processor:
-        # Use processor only for samples with actual multimodal content; use batched tokenizer for text-only.
-        text_only = []
-        multimodal = []
-        for sample in origin_samples:
-            if sample.multimodal_inputs and any(v is not None for v in sample.multimodal_inputs.values()):
-                multimodal.append(sample)
-            else:
-                text_only.append(sample)
-        filtered_samples = []
-        if text_only:
-            prompts = [s.prompt for s in text_only]
-            input_ids_list = tokenizer(prompts, add_special_tokens=False)["input_ids"]
-            for sample, input_ids in zip(text_only, input_ids_list, strict=True):
-                if len(input_ids) <= max_length:
-                    filtered_samples.append(sample)
-        if multimodal:
-            from slime.utils.processing_utils import process_vision_info
-
-            for sample in multimodal:
-                multimodal_inputs = process_vision_info(sample.prompt, processor)
-                processor_output = processor(text=sample.prompt, **multimodal_inputs)
-                input_ids = processor_output["input_ids"][0]
-                if len(input_ids) <= max_length:
-                    filtered_samples.append(sample)
-    else:
-        prompts = [sample.prompt for sample in origin_samples]
-        input_ids_list = tokenizer(prompts, add_special_tokens=False)["input_ids"]
-        filtered_samples = [
-            sample
-            for sample, input_ids in zip(origin_samples, input_ids_list, strict=True)
-            if len(input_ids) <= max_length
-        ]
-
-    logger.info(f"Filtered {len(origin_samples) - len(filtered_samples)} samples longer than max_length={max_length}.")
-
-    return filtered_samples
-
-
 def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimodal_keys: dict = None):
     prompt = data.get(prompt_key)
 
@@ -142,11 +123,9 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
         )
 
     if isinstance(prompt, str):
-        # If prompt is a string and we don't apply chat template, return the prompt as is.
         if not as_conversation:
             return prompt
-        else:
-            prompt = [{"role": "user", "content": prompt}]
+        prompt = [{"role": "user", "content": prompt}]
 
     if not isinstance(prompt, list):
         raise ValueError(
@@ -154,7 +133,6 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
         )
 
     if multimodal_keys:
-        # Build mapping: placeholder -> (MultimodalType, content_list)
         multimodals = {}
         for type_name, data_key in multimodal_keys.items():
             mt = MultimodalTypes.get(type_name)
@@ -163,47 +141,38 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
                 if multimodal_data is not None:
                     multimodals[mt.placeholder] = (mt, list(multimodal_data))
 
-        pattern = "(" + "|".join(re.escape(p) for p in multimodals.keys()) + ")"
+        if multimodals:
+            pattern = "(" + "|".join(re.escape(p) for p in multimodals.keys()) + ")"
 
-        for message in prompt:
-            if isinstance(message["content"], str):
-                content_list = []
-                for segment in re.split(pattern, message["content"]):
-                    if not segment:
-                        continue
-                    if segment in multimodals:
-                        mt, content = multimodals[segment]
-                        assert len(content) > 0, (
-                            f"Not enough {mt.name} data: more '{mt.placeholder}' placeholders in prompt "
-                            f"than {mt.name}s provided in data"
-                        )
-                        content_list.append({"type": mt.name, mt.name: content.pop(0)})
-                    else:
-                        content_list.append({"type": "text", "text": segment})
-                message["content"] = content_list
+            for message in prompt:
+                if isinstance(message["content"], str):
+                    content_list = []
+                    for segment in re.split(pattern, message["content"]):
+                        if not segment:
+                            continue
+                        if segment in multimodals:
+                            mt, content = multimodals[segment]
+                            assert len(content) > 0, (
+                                f"Not enough {mt.name} data: more '{mt.placeholder}' placeholders in prompt "
+                                f"than {mt.name}s provided in data"
+                            )
+                            content_list.append({"type": mt.name, mt.name: content.pop(0)})
+                        else:
+                            content_list.append({"type": "text", "text": segment})
+                    message["content"] = content_list
 
-            elif isinstance(message["content"], list):
-                # TODO: handle more general cases. where message['content'] is a dict and contains multiple types of content.
-                # e.g.
-                #  "content": [
-                #     {
-                #         "type": "image",
-                #         "image": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
-                #     },
-                #     {"type": "text", "text": "Describe this image."},
-                # ],
-                logger.warning("message['content'] is a list of dicts, no processing will be done.")
-                continue
-            else:
-                raise ValueError(
-                    f"Unsupported content type: {type(message['content'])}, expected str or list of dicts"
+                elif isinstance(message["content"], list):
+                    continue
+                else:
+                    raise ValueError(
+                        f"Unsupported content type: {type(message['content'])}, expected str or list of dicts"
+                    )
+
+            for placeholder, (mt, remaining) in multimodals.items():
+                assert len(remaining) == 0, (
+                    f"Multimodal data count mismatch: {len(remaining)} more {mt.name}(s)"
+                    f" than '{placeholder}' placeholders in prompt"
                 )
-
-        for placeholder, (mt, remaining) in multimodals.items():
-            assert len(remaining) == 0, (
-                f"Multimodal data count mismatch: {len(remaining)} more {mt.name}(s)"
-                f"than '{placeholder}' placeholders in prompt"
-            )
 
     return prompt
 
@@ -231,38 +200,6 @@ def _load_process_local_tokenizer_and_processor(tokenizer, processor):
     return loaded_tokenizer, loaded_processor
 
 
-def _process_single_record_mp(task: tuple[dict, dict]):
-    data, config = task
-    tokenizer, processor = _load_process_local_tokenizer_and_processor(config["tokenizer"], config["processor"])
-    return _process_single_record(
-        data,
-        tokenizer=tokenizer,
-        processor=processor,
-        prompt_key=config["prompt_key"],
-        multimodal_keys=config["multimodal_keys"],
-        label_key=config["label_key"],
-        tool_key=config["tool_key"],
-        metadata_key=config["metadata_key"],
-        apply_chat_template=config["apply_chat_template"],
-        apply_chat_template_kwargs=config["apply_chat_template_kwargs"],
-    )
-
-
-def _process_records_in_process_pool(all_data, process_config, max_workers, progress_kwargs):
-    with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp.get_context("spawn")) as executor:
-        return list(
-            tqdm(
-                executor.map(
-                    _process_single_record_mp,
-                    ((data, process_config) for data in all_data),
-                    chunksize=32,
-                ),
-                total=len(all_data),
-                **progress_kwargs,
-            )
-        )
-
-
 def _process_single_record(
     data: dict,
     *,
@@ -276,7 +213,6 @@ def _process_single_record(
     apply_chat_template: bool,
     apply_chat_template_kwargs: dict | None,
 ):
-    # Both chat templates and multimodal inputs require conversation format (list of message dicts)
     as_conversation = apply_chat_template or (multimodal_keys is not None)
     prompt = _build_messages(data, prompt_key, as_conversation, multimodal_keys)
     raw_prompt = copy.deepcopy(prompt)
@@ -314,6 +250,120 @@ def _process_single_record(
     )
 
 
+def _get_prompt_length(sample: Sample, tokenizer, processor):
+    # 保持和你原本语义一致：只有 prompt 是字符串时才做 max_length 过滤
+    if not isinstance(sample.prompt, str):
+        return None
+
+    is_mm = (
+        processor is not None
+        and sample.multimodal_inputs is not None
+        and any(v is not None for v in sample.multimodal_inputs.values())
+    )
+
+    if is_mm:
+        encoded = processor(text=sample.prompt, **sample.multimodal_inputs)
+        return len(encoded["input_ids"][0])
+
+    input_ids = tokenizer(sample.prompt, add_special_tokens=False)["input_ids"]
+    return len(input_ids)
+
+
+# =========================
+# process-pool globals
+# =========================
+
+_WORKER_TOKENIZER = None
+_WORKER_PROCESSOR = None
+_WORKER_CFG = None
+
+
+def _init_dataset_worker(tokenizer_ref, processor_ref, worker_cfg):
+    global _WORKER_TOKENIZER, _WORKER_PROCESSOR, _WORKER_CFG
+    _WORKER_TOKENIZER, _WORKER_PROCESSOR = _load_process_local_tokenizer_and_processor(
+        tokenizer_ref, processor_ref
+    )
+    _WORKER_CFG = worker_cfg
+
+
+def _process_record_batch_mp(data_batch: list[dict]):
+    out = []
+    dropped = 0
+
+    for data in data_batch:
+        sample = _process_single_record(
+            data,
+            tokenizer=_WORKER_TOKENIZER,
+            processor=_WORKER_PROCESSOR,
+            prompt_key=_WORKER_CFG["prompt_key"],
+            multimodal_keys=_WORKER_CFG["multimodal_keys"],
+            label_key=_WORKER_CFG["label_key"],
+            tool_key=_WORKER_CFG["tool_key"],
+            metadata_key=_WORKER_CFG["metadata_key"],
+            apply_chat_template=_WORKER_CFG["apply_chat_template"],
+            apply_chat_template_kwargs=_WORKER_CFG["apply_chat_template_kwargs"],
+        )
+
+        max_length = _WORKER_CFG["max_length"]
+        if max_length is not None:
+            prompt_len = _get_prompt_length(sample, _WORKER_TOKENIZER, _WORKER_PROCESSOR)
+            if prompt_len is not None:
+                if prompt_len > max_length:
+                    dropped += 1
+                    continue
+                sample.metadata["prompt_length"] = prompt_len
+
+        out.append(sample)
+
+    return len(data_batch), dropped, out
+
+
+def _process_records_in_process_pool(
+    path,
+    process_config,
+    max_workers,
+    progress_desc,
+    task_batch_size=128,
+    mp_start_method="spawn",
+):
+    total_rows = _estimate_num_rows(path)
+
+    # Linux 上如果你确认环境稳定，可以改成 fork，通常更快
+    # 但默认保守一点，仍用 spawn
+    ctx = mp.get_context(mp_start_method)
+
+    all_samples = []
+    dropped_total = 0
+
+    with ProcessPoolExecutor(
+        max_workers=max_workers,
+        mp_context=ctx,
+        initializer=_init_dataset_worker,
+        initargs=(
+            process_config["tokenizer"],
+            process_config["processor"],
+            process_config,
+        ),
+    ) as executor:
+        batch_iter = _batched(read_file(path), task_batch_size)
+        mapped = executor.map(_process_record_batch_mp, batch_iter, chunksize=1)
+
+        with tqdm(total=total_rows, desc=progress_desc, unit="samples") as pbar:
+            for input_count, dropped, samples in mapped:
+                all_samples.extend(samples)
+                dropped_total += dropped
+                pbar.update(input_count)
+
+    if process_config["max_length"] is not None:
+        logger.info(
+            "Filtered %s samples longer than max_length=%s during parallel loading.",
+            dropped_total,
+            process_config["max_length"],
+        )
+
+    return all_samples
+
+
 class Dataset:
     def __init__(
         self,
@@ -331,13 +381,16 @@ class Dataset:
         apply_chat_template=False,
         apply_chat_template_kwargs=None,
         multimodal_load_workers=0,
+        multimodal_task_batch_size=128,
+        mp_start_method="spawn",
     ):
-        all_data = list(read_file(path))
         progress_desc = f"Loading dataset {os.path.basename(_parse_generalized_path(path)[0])}"
-        progress_kwargs = {"desc": progress_desc, "unit": "samples", "miniters": 5000}
-        if processor and multimodal_load_workers and multimodal_load_workers > 1:
+
+        # 只有在真正需要多进程时才走 pool
+        if processor is not None and multimodal_load_workers and multimodal_load_workers > 1:
             tokenizer_ref = getattr(tokenizer, "name_or_path", tokenizer)
             processor_ref = getattr(processor, "name_or_path", processor)
+
             process_config = {
                 "tokenizer": tokenizer_ref,
                 "processor": processor_ref,
@@ -348,21 +401,33 @@ class Dataset:
                 "metadata_key": metadata_key,
                 "apply_chat_template": apply_chat_template,
                 "apply_chat_template_kwargs": apply_chat_template_kwargs,
+                "max_length": max_length,
             }
+
             logger.info(
-                "Loading multimodal dataset with %s worker processes from %s",
+                "Loading multimodal dataset with %s worker processes from %s "
+                "(task_batch_size=%s, start_method=%s)",
                 multimodal_load_workers,
                 path,
+                multimodal_task_batch_size,
+                mp_start_method,
             )
-            origin_samples = _process_records_in_process_pool(
-                all_data,
+
+            self.origin_samples = _process_records_in_process_pool(
+                path=path,
                 process_config=process_config,
                 max_workers=multimodal_load_workers,
-                progress_kwargs=progress_kwargs,
+                progress_desc=progress_desc,
+                task_batch_size=multimodal_task_batch_size,
+                mp_start_method=mp_start_method,
             )
         else:
-            origin_samples = [
-                _process_single_record(
+            total_rows = _estimate_num_rows(path)
+            origin_samples = []
+            dropped = 0
+
+            for data in tqdm(read_file(path), total=total_rows, desc=progress_desc, unit="samples"):
+                sample = _process_single_record(
                     data,
                     tokenizer=tokenizer,
                     processor=processor,
@@ -374,12 +439,24 @@ class Dataset:
                     apply_chat_template=apply_chat_template,
                     apply_chat_template_kwargs=apply_chat_template_kwargs,
                 )
-                for data in tqdm(all_data, **progress_kwargs)
-            ]
 
-        if max_length is not None:
-            self.origin_samples = filter_long_prompt(origin_samples, tokenizer, processor, max_length)
-        else:
+                if max_length is not None:
+                    prompt_len = _get_prompt_length(sample, tokenizer, processor)
+                    if prompt_len is not None:
+                        if prompt_len > max_length:
+                            dropped += 1
+                            continue
+                        sample.metadata["prompt_length"] = prompt_len
+
+                origin_samples.append(sample)
+
+            if max_length is not None:
+                logger.info(
+                    "Filtered %s samples longer than max_length=%s during serial loading.",
+                    dropped,
+                    max_length,
+                )
+
             self.origin_samples = origin_samples
 
         self.epoch_id = -1
@@ -404,7 +481,6 @@ class Dataset:
 
 
 def get_minimum_num_micro_batch_size(total_lengths, max_tokens_per_gpu):
-    # use first fit to get the number of micro batches
     batches = []
     for length in total_lengths:
         for i in range(len(batches)):
@@ -413,7 +489,6 @@ def get_minimum_num_micro_batch_size(total_lengths, max_tokens_per_gpu):
                 break
         else:
             batches.append(length)
-
     return len(batches)
 
 
@@ -424,7 +499,6 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
     partition = rollout_data.pop("partition")
     total_lengths = rollout_data["total_lengths"]
 
-    # save the seqlen of the whole rollout batch
     Timer().seq_lens = total_lengths
     rollout_data["total_lengths"] = [total_lengths[i] for i in partition]
 

@@ -1281,6 +1281,55 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--gold-train-response-prefix-ratio",
+                type=float,
+                default=None,
+                help=(
+                    "Keep only the first ratio of response tokens in training loss/advantage masks. "
+                    "For example, 0.5 keeps the first half and masks the second half. "
+                    "Used by multimodal GOLD-based custom reward/loss hooks."
+                ),
+            )
+            parser.add_argument(
+                "--gold-student-temperature",
+                type=float,
+                default=1.0,
+                help="Temperature applied to student logits in logits-level GOLD custom loss.",
+            )
+            parser.add_argument(
+                "--gold-teacher-temperature",
+                type=float,
+                default=1.0,
+                help="Temperature applied to teacher log-prob targets in logits-level GOLD custom loss.",
+            )
+            parser.add_argument(
+                "--gold-distillation-weight",
+                type=float,
+                default=1.0,
+                help="Weight of logits-level GOLD distillation term.",
+            )
+            parser.add_argument(
+                "--gold-cross-entropy-weight",
+                type=float,
+                default=0.0,
+                help="Optional weight of student response cross-entropy term in logits-level GOLD custom loss.",
+            )
+            parser.add_argument(
+                "--gold-use-extended-uld",
+                action="store_true",
+                default=False,
+                help="Enable group-aligned extended ULD/GOLD style aggregation for multimodal logits-level distillation.",
+            )
+            parser.add_argument(
+                "--gold-teacher-topk-logprobs",
+                type=int,
+                default=0,
+                help=(
+                    "Optional top-k logprobs to request from the teacher service for logits-level GOLD. "
+                    "0 means use the service default / token logprobs only."
+                ),
+            )
+            parser.add_argument(
                 "--custom-convert-samples-to-train-data-path",
                 type=str,
                 default=None,
