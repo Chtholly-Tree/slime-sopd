@@ -27,6 +27,7 @@ Design goals:
 """
 from __future__ import annotations
 
+import math
 import os
 import time
 
@@ -94,6 +95,7 @@ def _build_teacher_prompt_text(args, sample: Sample) -> str:
         tools=tools,
         tokenize=False,
         add_generation_prompt=True,
+        enable_thinking=True
     )
 
 
@@ -301,20 +303,11 @@ def _prepare_gold_teacher_log_probs(args, sample: Sample, teacher_result: dict) 
     teacher_response_len = len(teacher_result["meta_info"]["gold_teacher_input_ids"]) - teacher_prompt_len
     teacher_triplets = _extract_teacher_response_triplets(teacher_result, teacher_prompt_len, teacher_response_len)
     teacher_log_probs = torch.tensor([float(item[0]) for item in teacher_triplets], dtype=torch.float32)
-    teacher_tokens = [str(item[2]) if len(item) > 2 and item[2] is not None else str(item[1]) for item in teacher_triplets]
 
     student_tokenizer = _get_student_tokenizer(args.hf_checkpoint)
     student_token_ids = _decode_student_response_ids(sample)
-    student_pieces_start_time = time.perf_counter()
     student_pieces = _to_canonical_pieces_from_ids(student_tokenizer, student_token_ids)
-    student_pieces_elapsed = time.perf_counter() - student_pieces_start_time
-    teacher_pieces_start_time = time.perf_counter()
     teacher_pieces = _to_canonical_pieces_from_triplets(teacher_triplets)
-    teacher_pieces_elapsed = time.perf_counter() - teacher_pieces_start_time
-    print(
-        f"[multimodal_gold] piece build student={student_pieces_elapsed:.6f}s teacher={teacher_pieces_elapsed:.6f}s "
-        f"student_tokens={len(student_token_ids)} teacher_tokens={len(teacher_triplets)}"
-    )
 
     student_len = min(len(student_pieces), len(student_log_probs))
     teacher_len = min(len(teacher_pieces), len(teacher_log_probs))
@@ -323,7 +316,6 @@ def _prepare_gold_teacher_log_probs(args, sample: Sample, teacher_result: dict) 
     teacher_pieces = teacher_pieces[:teacher_len]
     teacher_log_probs = teacher_log_probs[:teacher_len]
     teacher_triplets = teacher_triplets[:teacher_len]
-    teacher_tokens = teacher_tokens[:teacher_len]
 
     student_groups, teacher_groups = _build_alignment_groups(student_pieces, teacher_pieces)
 
@@ -340,42 +332,52 @@ def _prepare_gold_teacher_log_probs(args, sample: Sample, teacher_result: dict) 
         for idx in student_group:
             synthetic_teacher_log_probs[idx] = student_log_probs[idx] - group_logprob_gap
 
-        gold_groups.append(
-            {
-                "student_group": student_group,
-                "teacher_group": teacher_group,
-                "student_text": "".join(student_pieces[idx] for idx in student_group),
-                "teacher_text": "".join(teacher_pieces[idx] for idx in teacher_group),
-                "student_group_logprob": student_group_logprob,
-                "teacher_group_logprob": teacher_group_logprob,
-                "group_logprob_gap": group_logprob_gap,
-            }
-        )
-
     sample.metadata["teacher_token_triplets"] = teacher_triplets
-    sample.metadata["gold_groups"] = gold_groups
-    sample.metadata["gold_debug"] = {
-        "student_tokens": student_pieces,
-        "teacher_tokens": teacher_pieces,
-        "student_raw_tokens": [str(tok) for tok in student_tokenizer.convert_ids_to_tokens(student_token_ids[:student_len])],
-        "teacher_raw_tokens": teacher_tokens,
-        "group_mappings": [
-            {
-                "student_group": item["student_group"],
-                "teacher_group": item["teacher_group"],
-                "student_text": item["student_text"],
-                "teacher_text": item["teacher_text"],
-                "group_logprob_gap": item["group_logprob_gap"],
-            }
-            for item in gold_groups
-        ],
-    }
     mapping_elapsed = time.perf_counter() - mapping_start_time
     print(
         f"[multimodal_gold] sample _prepare_gold_teacher_log_probs total={mapping_elapsed:.6f}s "
         f"student_tokens={len(student_token_ids)} teacher_tokens={len(teacher_triplets)} groups={len(gold_groups)}"
     )
     return synthetic_teacher_log_probs, mapping_elapsed
+
+
+def _apply_response_prefix_loss_mask(args, sample: Sample) -> None:
+    ratio = getattr(args, "gold_train_response_prefix_ratio", None)
+    if ratio is None:
+        return
+
+    ratio = float(ratio)
+    if not (0.0 <= ratio <= 1.0):
+        raise ValueError(f"gold_train_response_prefix_ratio must be in [0, 1], got {ratio}")
+
+    response_length = int(sample.response_length)
+    if response_length <= 0:
+        sample.loss_mask = []
+        return
+
+    keep_tokens = math.ceil(response_length * ratio)
+    keep_tokens = min(max(keep_tokens, 0), response_length)
+    sample.loss_mask = [1] * keep_tokens + [0] * (response_length - keep_tokens)
+
+
+def _normalize_outcome_rewards(args, raw_scores: list[float]) -> list[float]:
+    rewards = torch.tensor(raw_scores, dtype=torch.float32)
+
+    if (
+        args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
+        and getattr(args, "rewards_normalization", False)
+    ):
+        if rewards.shape[-1] == args.n_samples_per_prompt * args.rollout_batch_size:
+            rewards = rewards.reshape(-1, args.n_samples_per_prompt)
+        else:
+            rewards = rewards.view(-1, rewards.shape[-1])
+
+        rewards = rewards - rewards.mean(dim=-1, keepdim=True)
+
+        if args.advantage_estimator in ["grpo", "gspo"] and getattr(args, "grpo_std_normalization", False):
+            rewards = rewards / (rewards.std(dim=-1, keepdim=True) + 1e-6)
+
+    return rewards.flatten().tolist()
 
 
 def post_process_rewards(args, samples: list[Sample], **kwargs):
@@ -385,10 +387,9 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
     (with decoded text pieces for GOLD alignment) are fetched here, similar to
     the multimodal OPD post-process flow.
 
-    No scalar reward is used for training in this algorithm. We always return:
-    - raw rewards: for logging / supervision
-    - processed rewards: all zeros so advantage comes only from GOLD-projected
-      teacher log-probs.
+    Outcome rewards are normalized with the same group-wise GRPO logic as the
+    default rollout path, then returned as processed rewards for advantage
+    computation.
     """
     import asyncio as _asyncio
     from slime.utils.async_utils import get_async_loop
@@ -413,6 +414,7 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
     mapping_total_elapsed = 0.0
     for sample, teacher_result, raw_reward in zip(samples, teacher_results, raw_scores, strict=False):
         sample.teacher_log_probs, mapping_elapsed = _prepare_gold_teacher_log_probs(args, sample, teacher_result)
+        _apply_response_prefix_loss_mask(args, sample)
         mapping_total_elapsed += mapping_elapsed
         sample.metadata["gold_raw_reward"] = raw_reward
 
@@ -421,5 +423,5 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
         f"({(mapping_total_elapsed / len(samples)) if samples else 0.0:.3f}s/sample)"
     )
 
-    zero_rewards = [0.0] * len(samples)
-    return raw_scores, zero_rewards
+    processed_rewards = _normalize_outcome_rewards(args, raw_scores)
+    return raw_scores, processed_rewards
