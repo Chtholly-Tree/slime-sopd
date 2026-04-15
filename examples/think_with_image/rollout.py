@@ -9,7 +9,7 @@ Flow per sample:
        - If <answer>: done, record final answer
        - If <tool_call>: execute tool, encode observation (loss_mask=0)
     3. Repeat until max_turns or model provides <answer>
-    4. Finalize: decode response, merge multimodal inputs, set status
+    4. Finalize: decode response, merge multimodal inputs, prepare teacher GOLD signal, set status
 """
 
 from __future__ import annotations
@@ -64,7 +64,11 @@ def _build_env(env_module, sample: Sample, args: Any):
 
 
 def _encode_observation(tokenizer, processor, message: dict, metadata: dict | None, args: Any):
-    """Encode observation message for generation. Returns (prompt_ids, image_data)."""
+    """Encode observation message for generation and training.
+
+    Returns:
+        tuple[prompt_ids, image_data, multimodal_train_inputs]
+    """
     tools = metadata.get("tools") if metadata else None
     apply_kwargs = getattr(args, "apply_chat_template_kwargs", None) or {}
 
@@ -77,12 +81,14 @@ def _encode_observation(tokenizer, processor, message: dict, metadata: dict | No
         formatted = [message]
 
     multimodal_inputs = None
+    multimodal_train_inputs = None
     if processor:
         from qwen_vl_utils import process_vision_info
         images, videos = process_vision_info([message])
         multimodal_inputs = {"images": images, "videos": videos}
         output = processor(text=formatted, **multimodal_inputs)
         prompt_ids = output["input_ids"][0]
+        multimodal_train_inputs = {k: v for k, v in output.items() if k not in ("input_ids", "attention_mask")} or None
     else:
         prompt_ids = tokenizer.encode(formatted, add_special_tokens=False)
 
@@ -93,7 +99,7 @@ def _encode_observation(tokenizer, processor, message: dict, metadata: dict | No
     if multimodal_inputs and multimodal_inputs.get("images"):
         image_data = [encode_image_for_rollout_engine(img) for img in multimodal_inputs["images"]]
 
-    return prompt_ids, image_data
+    return prompt_ids, image_data, multimodal_train_inputs
 
 
 def _merge_multimodal_inputs(chunks: list[dict | None]) -> dict | None:
@@ -130,15 +136,27 @@ async def _run_inference(url: str, tokens: list[int], sampling_params: dict, ima
     return response_text, new_tokens, new_logprobs, finish_type
 
 
-def _append_tokens(sample: Sample, response_tokens: list[int], tokens: list[int], logprobs: list[float], loss_mask: int):
+def _append_tokens(
+    sample: Sample,
+    train_response_tokens: list[int],
+    all_response_tokens: list[int],
+    assistant_positions: list[int],
+    tokens: list[int],
+    logprobs: list[float],
+    loss_mask: int,
+):
     """Append tokens to sample with specified loss_mask."""
+    start = len(all_response_tokens)
     sample.tokens.extend(tokens)
-    response_tokens.extend(tokens)
+    all_response_tokens.extend(tokens)
     sample.loss_mask.extend([loss_mask] * len(tokens))
     sample.rollout_log_probs.extend(logprobs)
+    if loss_mask == 1:
+        train_response_tokens.extend(tokens)
+        assistant_positions.extend(range(start, start + len(tokens)))
 
 
-async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
+async def generate(args: Any, sample: Sample, sampling_params, evaluation: bool = False) -> Sample:
     """
     Main entry point for multi-turn VLM tool-calling rollout.
     """
@@ -172,11 +190,19 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
     sample.loss_mask = sample.loss_mask or []
     sample.rollout_log_probs = sample.rollout_log_probs or []
 
+    teacher_state = None
+    if not evaluation:
+        from examples.think_with_image.gold_utils import build_teacher_rollout_state
+
+        teacher_state = build_teacher_rollout_state(args, sample)
+
     current_images = []
     if sample.multimodal_inputs and sample.multimodal_inputs.get("images"):
         current_images = [encode_image_for_rollout_engine(img) for img in sample.multimodal_inputs["images"]]
 
-    response_tokens: list[int] = []
+    train_response_tokens: list[int] = []
+    all_response_tokens: list[int] = []
+    assistant_positions: list[int] = []
     mm_inputs_buffer: list = [mm_train_inputs] if mm_train_inputs else []
     budget = None
     if args.rollout_max_context_len:
@@ -201,9 +227,19 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             response_text, new_tokens, new_logprobs, finish_type = await _run_inference(
                 url, sample.tokens, cur_params, current_images
             )
-            breakpoint()
-            # Record assistant tokens (loss=1)
-            _append_tokens(sample, response_tokens, new_tokens, new_logprobs, loss_mask=1)
+            _append_tokens(
+                sample,
+                train_response_tokens,
+                all_response_tokens,
+                assistant_positions,
+                new_tokens,
+                new_logprobs,
+                loss_mask=1,
+            )
+            if teacher_state is not None:
+                from examples.think_with_image.gold_utils import append_teacher_response_text
+
+                append_teacher_response_text(args, teacher_state, response_text, turn)
             if budget is not None:
                 budget -= len(new_tokens)
 
@@ -220,11 +256,25 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
 
             # Encode observation (loss=0)
             next_msg = env.format_observation(observation)
-            obs_ids, obs_images = _encode_observation(state.tokenizer, state.processor, next_msg, sample.metadata, args)
+            obs_ids, obs_images, obs_mm_train_inputs = _encode_observation(
+                state.tokenizer, state.processor, next_msg, sample.metadata, args
+            )
             if state.tokenizer.bos_token_id and obs_ids and obs_ids[0] == state.tokenizer.bos_token_id:
                 obs_ids = obs_ids[1:]
 
-            _append_tokens(sample, response_tokens, obs_ids, [0.0] * len(obs_ids), loss_mask=0)
+            _append_tokens(
+                sample,
+                train_response_tokens,
+                all_response_tokens,
+                assistant_positions,
+                obs_ids,
+                [0.0] * len(obs_ids),
+                loss_mask=0,
+            )
+            if teacher_state is not None:
+                from examples.think_with_image.gold_utils import append_teacher_observation_message
+
+                append_teacher_observation_message(args, teacher_state, next_msg, sample.metadata, turn)
             if budget is not None:
                 budget -= len(obs_ids)
 
@@ -236,7 +286,7 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
                 for k, v in observation["multi_modal_data"].items():
                     if v:
                         sample.multimodal_inputs.setdefault(k, []).extend(v)
-            mm_inputs_buffer.append(None)
+            mm_inputs_buffer.append(obs_mm_train_inputs)
 
             # Check max turns
             if turn + 1 >= max_turns:
@@ -247,8 +297,13 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
         if sample.status is None:
             sample.status = Sample.Status.COMPLETED
         sample.multimodal_train_inputs = _merge_multimodal_inputs(mm_inputs_buffer)
-        sample.response = state.tokenizer.decode(response_tokens, skip_special_tokens=False)
-        sample.response_length = len(response_tokens)
+        sample.response = state.tokenizer.decode(train_response_tokens, skip_special_tokens=False)
+        sample.response_length = len(all_response_tokens)
+        sample.metadata["student_assistant_response_positions"] = assistant_positions
+        if teacher_state is not None:
+            from examples.think_with_image.gold_utils import prepare_teacher_multiturn_gold
+
+            sample = await prepare_teacher_multiturn_gold(args, sample, teacher_state)
         return sample
 
     finally:
