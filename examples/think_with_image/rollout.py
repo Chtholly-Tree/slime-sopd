@@ -14,6 +14,7 @@ Flow per sample:
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import importlib.util
 import logging
@@ -84,11 +85,14 @@ def _encode_observation(tokenizer, processor, message: dict, metadata: dict | No
     multimodal_train_inputs = None
     if processor:
         from qwen_vl_utils import process_vision_info
-        images, videos = process_vision_info([message])
-        multimodal_inputs = {"images": images, "videos": videos}
+        images, _ = process_vision_info([message])
+        multimodal_inputs = {"images": images} if images else {}
         output = processor(text=formatted, **multimodal_inputs)
         prompt_ids = output["input_ids"][0]
-        multimodal_train_inputs = {k: v for k, v in output.items() if k not in ("input_ids", "attention_mask")} or None
+        multimodal_train_inputs = {
+            k: v for k, v in output.items()
+            if k not in ("input_ids", "attention_mask") and not k.startswith("video")
+        } or None
     else:
         prompt_ids = tokenizer.encode(formatted, add_special_tokens=False)
 
@@ -111,9 +115,18 @@ def _merge_multimodal_inputs(chunks: list[dict | None]) -> dict | None:
         if not chunk:
             continue
         for k, v in chunk.items():
-            if v is not None and isinstance(v, torch.Tensor):
+            if k.startswith("video"):
+                continue
+            if v is not None and isinstance(v, torch.Tensor) and v.numel() > 0:
                 values.setdefault(k, []).append(v)
-    return {k: torch.cat(v, dim=0) for k, v in values.items()} if values else None
+    if not values:
+        return None
+    result = {}
+    for k, v in values.items():
+        merged = torch.cat(v, dim=0)
+        if merged.numel() > 0:
+            result[k] = merged
+    return result if result else None
 
 
 async def _run_inference(url: str, tokens: list[int], sampling_params: dict, image_data):
@@ -134,6 +147,29 @@ async def _run_inference(url: str, tokens: list[int], sampling_params: dict, ima
 
     finish_type = meta.get("finish_reason", {}).get("type", "")
     return response_text, new_tokens, new_logprobs, finish_type
+
+
+async def _run_env_step(env: Any, response_text: str):
+    return await asyncio.to_thread(env.step, response_text)
+
+
+def _prepare_initial_multimodal_inputs(sample: Sample, processor, prompt):
+    mm_inputs = {k: v for k, v in sample.multimodal_inputs.items() if not k.startswith("video")}
+    proc_output = processor(text=prompt, **mm_inputs)
+    prompt_ids = proc_output["input_ids"][0]
+    mm_train_inputs = {
+        k: v for k, v in proc_output.items()
+        if k not in ("input_ids", "attention_mask") and not k.startswith("video")
+    } or None
+    return prompt_ids, mm_train_inputs
+
+
+def _prepare_initial_tokenized_inputs(sample: Sample, tokenizer):
+    return tokenizer.encode(sample.prompt, add_special_tokens=False)
+
+
+def _prepare_initial_image_data(sample: Sample) -> list[str]:
+    return [encode_image_for_rollout_engine(img) for img in sample.multimodal_inputs["images"]]
 
 
 def _append_tokens(
@@ -179,11 +215,11 @@ async def generate(args: Any, sample: Sample, sampling_params, evaluation: bool 
 
     # Prepare initial inputs
     if sample.multimodal_inputs and state.processor:
-        proc_output = state.processor(text=sample.prompt, **sample.multimodal_inputs)
-        prompt_ids = proc_output["input_ids"][0]
-        mm_train_inputs = {k: v for k, v in proc_output.items() if k not in ("input_ids", "attention_mask")} or None
+        prompt_ids, mm_train_inputs = await asyncio.to_thread(
+            _prepare_initial_multimodal_inputs, sample, state.processor, sample.prompt
+        )
     else:
-        prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
+        prompt_ids = await asyncio.to_thread(_prepare_initial_tokenized_inputs, sample, state.tokenizer)
         mm_train_inputs = None
 
     sample.tokens = list(prompt_ids)
@@ -194,11 +230,11 @@ async def generate(args: Any, sample: Sample, sampling_params, evaluation: bool 
     if not evaluation:
         from examples.think_with_image.gold_utils import build_teacher_rollout_state
 
-        teacher_state = build_teacher_rollout_state(args, sample)
+        teacher_state = await asyncio.to_thread(build_teacher_rollout_state, args, sample)
 
     current_images = []
     if sample.multimodal_inputs and sample.multimodal_inputs.get("images"):
-        current_images = [encode_image_for_rollout_engine(img) for img in sample.multimodal_inputs["images"]]
+        current_images = await asyncio.to_thread(_prepare_initial_image_data, sample)
 
     train_response_tokens: list[int] = []
     all_response_tokens: list[int] = []
@@ -206,9 +242,9 @@ async def generate(args: Any, sample: Sample, sampling_params, evaluation: bool 
     mm_inputs_buffer: list = [mm_train_inputs] if mm_train_inputs else []
     budget = None
     if args.rollout_max_context_len:
-        budget = args.rollout_max_context_len - len(sample.tokens)
+        budget = args.rollout_max_context_len
     elif sampling_params.get("max_new_tokens"):
-        budget = sampling_params["max_new_tokens"] - len(sample.tokens)
+        budget = sampling_params["max_new_tokens"]
 
     sampling_params = deepcopy(sampling_params)
     sample.status = None
@@ -249,15 +285,20 @@ async def generate(args: Any, sample: Sample, sampling_params, evaluation: bool 
                 break
 
             # Env step
-            observation, done, _ = env.step(response_text)
+            observation, done, _ = await _run_env_step(env, response_text)
             if done:
                 sample.status = Sample.Status.COMPLETED
                 break
 
             # Encode observation (loss=0)
             next_msg = env.format_observation(observation)
-            obs_ids, obs_images, obs_mm_train_inputs = _encode_observation(
-                state.tokenizer, state.processor, next_msg, sample.metadata, args
+            obs_ids, obs_images, obs_mm_train_inputs = await asyncio.to_thread(
+                _encode_observation,
+                state.tokenizer,
+                state.processor,
+                next_msg,
+                sample.metadata,
+                args,
             )
             if state.tokenizer.bos_token_id and obs_ids and obs_ids[0] == state.tokenizer.bos_token_id:
                 obs_ids = obs_ids[1:]
@@ -274,7 +315,14 @@ async def generate(args: Any, sample: Sample, sampling_params, evaluation: bool 
             if teacher_state is not None:
                 from examples.think_with_image.gold_utils import append_teacher_observation_message
 
-                append_teacher_observation_message(args, teacher_state, next_msg, sample.metadata, turn)
+                await asyncio.to_thread(
+                    append_teacher_observation_message,
+                    args,
+                    teacher_state,
+                    next_msg,
+                    sample.metadata,
+                    turn,
+                )
             if budget is not None:
                 budget -= len(obs_ids)
 

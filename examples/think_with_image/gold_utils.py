@@ -92,13 +92,35 @@ def _encode_increment(tokenizer, processor, message: dict, metadata: dict | None
     return prompt_ids, image_data
 
 
+def _build_teacher_prompt_text(args: Any, sample: Sample) -> str:
+    raw_prompt = sample.metadata.get("raw_prompt") if sample.metadata else None
+    if raw_prompt is None:
+        assert isinstance(sample.prompt, str), "think_with_image expects sample.prompt to be a string when raw_prompt is missing"
+        return sample.prompt
+
+    if isinstance(raw_prompt, str):
+        return raw_prompt
+
+    tools = sample.metadata.get("tools") if sample.metadata else None
+    apply_kwargs = getattr(args, "apply_chat_template_kwargs", None) or {}
+    tok = _teacher_tokenizer(args)
+    return tok.apply_chat_template(
+        raw_prompt,
+        tools=tools,
+        tokenize=False,
+        add_generation_prompt=True,
+        **apply_kwargs,
+    )
+
+
 def build_teacher_rollout_state(args: Any, sample: Sample) -> TeacherRolloutState:
     tok = _teacher_tokenizer(args)
     proc = _teacher_processor(args)
+    teacher_prompt = _build_teacher_prompt_text(args, sample)
     if proc and sample.multimodal_inputs and any(v is not None for v in sample.multimodal_inputs.values()):
-        prompt_ids = _tolist(proc(text=sample.prompt, **sample.multimodal_inputs)["input_ids"][0])
+        prompt_ids = _tolist(proc(text=teacher_prompt, **sample.multimodal_inputs)["input_ids"][0])
     else:
-        prompt_ids = _tolist(tok.encode(sample.prompt, add_special_tokens=False))
+        prompt_ids = _tolist(tok.encode(teacher_prompt, add_special_tokens=False))
     image_data = [encode_image_for_rollout_engine(img) for img in (sample.multimodal_inputs or {}).get("images", [])]
     return TeacherRolloutState(prompt_ids, image_data, [{"kind": "prompt", "turn": -1, "start": 0, "end": len(prompt_ids)}])
 

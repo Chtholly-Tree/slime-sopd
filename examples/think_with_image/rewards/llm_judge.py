@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any
 
@@ -65,6 +66,25 @@ def _get_config(args) -> dict[str, Any]:
     }
 
 
+def _get_raw_question(sample: Sample) -> str:
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    question = (
+        metadata.get("problem")
+        or metadata.get("prompt")
+        or metadata.get("raw_prompt")
+        or metadata.get("question")
+        or sample.prompt
+    )
+    return question if isinstance(question, str) else str(question)
+
+
+def _extract_final_answer(response: str) -> str:
+    match = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return "No answer."
+
+
 async def _call_judge(
     session: aiohttp.ClientSession,
     config: dict[str, Any],
@@ -72,18 +92,17 @@ async def _call_judge(
 ) -> tuple[str, int]:
     """Call judge API with exponential-backoff retry. Returns (response, attempts)."""
     max_retries = config["max_retries"]
-    headers = {"Authorization": f"Bearer {config['api_key']}", "Content-Type": "application/json"}
+    headers = { "Content-Type": "application/json"}
     payload = {
         "model": config["model"],
         "messages": messages,
         "max_tokens": config["max_tokens"],
         "temperature": config["temperature"],
     }
-
     for attempt in range(max_retries + 1):
         try:
             async with session.post(
-                f"{config['base_url'].rstrip('/')}/chat/completions", headers=headers, json=payload
+                f"{config['base_url'].rstrip('/')}/v1/chat/completions", headers=headers, json=payload
             ) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
@@ -100,13 +119,12 @@ async def _call_judge(
 
 
 async def _evaluate_single(config: dict[str, Any], sample: Sample) -> float:
-    question = sample.prompt if isinstance(sample.prompt, str) else str(sample.prompt)
+    question = _get_raw_question(sample)
     standard_answer = str(sample.label) if sample.label is not None else ""
-    model_answer = sample.response or ""
+    model_answer = _extract_final_answer(sample.response or "")
 
     messages = build_judge_messages(question, standard_answer, model_answer)
     response, _ = await _call_judge(_get_session(), config, messages)
-
     if not response:
         logger.warning("Sample %d: empty judge response, reward=0", sample.index)
         return 0.0
@@ -164,4 +182,3 @@ async def async_rm(args: Any, samples: Sample | list[Sample]) -> float | list[fl
     )
 
     return rewards[0] if single_sample else rewards
-
