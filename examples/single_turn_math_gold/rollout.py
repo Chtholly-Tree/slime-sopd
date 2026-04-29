@@ -3,12 +3,11 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-import aiohttp
-
 from examples.single_turn_math_gold.gold_utils import (
     apply_response_prefix_loss_mask,
     build_teacher_prompt_ids,
     build_teacher_result,
+    get_gold_http_session,
     prepare_teacher_log_probs,
 )
 from slime.rollout.sglang_rollout import GenerateState
@@ -17,11 +16,10 @@ from slime.utils.types import Sample
 
 
 async def _run_student_generate(url: str, payload: dict, headers: dict | None = None) -> dict:
-    timeout = aiohttp.ClientTimeout(total=1200)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, json=payload, headers=headers) as resp:
-            resp.raise_for_status()
-            return await resp.json()
+    session = get_gold_http_session("student")
+    async with session.post(url, json=payload, headers=headers) as resp:
+        resp.raise_for_status()
+        return await resp.json()
 
 
 async def generate(args: Any, sample: Sample, sampling_params, evaluation: bool = False) -> Sample:
